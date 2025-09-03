@@ -1,0 +1,151 @@
+# Import required libraries
+import os
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Conv2D, MaxPooling2D, Flatten, Dense, Dropout, BatchNormalization
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from sklearn.metrics import classification_report, confusion_matrix
+import time
+
+# Set random seed for reproducibility
+tf.random.set_seed(42)
+np.random.seed(42)
+
+# --- Data Preparation ---
+
+# Define image size and batch size
+IMG_HEIGHT, IMG_WIDTH = 240, 240
+BATCH_SIZE = 32
+
+# Define paths for dataset folders (update paths as per actual locations)
+train_dir = 'data/train'  # Folder with subfolders 'glioma', 'meningioma', 'pituitary'
+val_dir = 'data/val'
+test_dir = 'data/test'
+
+# Data augmentation and rescaling for training
+train_datagen = ImageDataGenerator(rescale=1./255,
+                                   rotation_range=20,
+                                   width_shift_range=0.1,
+                                   height_shift_range=0.1,
+                                   zoom_range=0.1,
+                                   horizontal_flip=True)
+
+# Rescaling for validation and test (no augmentation)
+val_datagen = ImageDataGenerator(rescale=1./255)
+test_datagen = ImageDataGenerator(rescale=1./255)
+
+# Generate batches of augmented/normalized images and labels from directory
+train_generator = train_datagen.flow_from_directory(train_dir,
+                                                    target_size=(IMG_HEIGHT, IMG_WIDTH),
+                                                    batch_size=BATCH_SIZE,
+                                                    class_mode='categorical',  # multi-class classification
+                                                    shuffle=True)
+
+val_generator = val_datagen.flow_from_directory(val_dir,
+                                                target_size=(IMG_HEIGHT, IMG_WIDTH),
+                                                batch_size=BATCH_SIZE,
+                                                class_mode='categorical',
+                                                shuffle=False)
+
+test_generator = test_datagen.flow_from_directory(test_dir,
+                                                  target_size=(IMG_HEIGHT, IMG_WIDTH),
+                                                  batch_size=BATCH_SIZE,
+                                                  class_mode='categorical',
+                                                  shuffle=False)
+
+# --- Define CNN Model Architecture ---
+
+model = Sequential()
+
+# First convolutional block
+model.add(Conv2D(32, (3, 3), activation='relu', padding='same', input_shape=(IMG_HEIGHT, IMG_WIDTH, 3)))
+model.add(BatchNormalization())
+model.add(MaxPooling2D(pool_size=(2, 2)))
+model.add(Dropout(0.25))
+
+# Second convolutional block
+model.add(Conv2D(64, (3, 3), activation='relu', padding='same'))
+model.add(BatchNormalization())
+model.add(MaxPooling2D(pool_size=(2, 2)))
+model.add(Dropout(0.25))
+
+# Third convolutional block
+model.add(Conv2D(128, (3, 3), activation='relu', padding='same'))
+model.add(BatchNormalization())
+model.add(MaxPooling2D(pool_size=(2, 2)))
+model.add(Dropout(0.25))
+
+# Flattening and fully connected layers
+model.add(Flatten())
+model.add(Dense(128, activation='relu'))
+model.add(Dropout(0.5))
+
+# Output layer for 3 classes with softmax activation
+model.add(Dense(3, activation='softmax'))
+
+# Compile the model with Adam optimizer and categorical cross-entropy loss
+model.compile(optimizer=Adam(learning_rate=0.001),
+              loss='categorical_crossentropy',
+              metrics=['accuracy'])
+
+# Print model summary
+model.summary()
+
+# --- Train the model ---
+
+# Use EarlyStopping to stop training if validation loss doesn't improve after 7 epochs
+early_stopping = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=7, restore_best_weights=True)
+
+# Train the model
+history = model.fit(train_generator,
+                    epochs=50,
+                    validation_data=val_generator,
+                    callbacks=[early_stopping])
+
+# --- Evaluate model on test set ---
+
+test_loss, test_acc = model.evaluate(test_generator)
+print(f"Test Accuracy: {test_acc*100:.2f}%")
+
+# Predict classes for test set
+y_pred_probs = model.predict(test_generator)
+y_pred = np.argmax(y_pred_probs, axis=1)
+
+# True labels
+y_true = test_generator.classes
+
+# Classification report
+target_names = list(test_generator.class_indices.keys())
+print(classification_report(y_true, y_pred, target_names=target_names))
+
+# Confusion matrix
+cm = confusion_matrix(y_true, y_pred)
+print("Confusion Matrix:")
+print(cm)
+
+# --- Measure inference efficiency ---
+
+# Number of test samples
+num_samples = test_generator.samples
+
+# To test inference speed, predict one image at a time repeatedly
+start_time = time.time()
+
+# Iterate through all samples one-by-one to measure latency
+for i in range(num_samples):
+    img, _ = test_generator[i]
+    model.predict(img)  # Single batch predict (batch size usually 32)
+
+end_time = time.time()
+total_time = end_time - start_time
+
+# Calculate throughput (images per second)
+throughput = num_samples / total_time
+avg_latency_ms = (total_time / num_samples) * 1000
+
+print(f"Inference throughput: {throughput:.2f} images/second")
+print(f"Average latency per image: {avg_latency_ms:.2f} ms")
+
+# --- End of script ---
