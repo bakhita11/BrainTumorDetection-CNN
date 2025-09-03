@@ -1,151 +1,338 @@
-# Import required libraries
+# =============================================================================
+# Brain Tumor Classification (Glioma / Meningioma / Pituitary)
+# Enhanced training script with rich logging, plots, class weights, and speed tests
+# =============================================================================
 import os
+import time
+import json
 import numpy as np
 import tensorflow as tf
+import matplotlib.pyplot as plt
+
+from sklearn.metrics import (classification_report, confusion_matrix, roc_curve,
+                             auc, precision_recall_curve)
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Conv2D, MaxPooling2D, Flatten, Dense, Dropout, BatchNormalization
+from tensorflow.keras.layers import (Conv2D, MaxPooling2D, Flatten, Dense,
+                                     Dropout, BatchNormalization)
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
-from sklearn.metrics import classification_report, confusion_matrix
-import time
+from tensorflow.keras.callbacks import (EarlyStopping, ReduceLROnPlateau,
+                                        ModelCheckpoint, TensorBoard)
 
-# Set random seed for reproducibility
+# ---------------------------
+# Reproducibility + Performance
+# ---------------------------
+os.environ["PYTHONHASHSEED"] = "42"
+os.environ["TF_DETERMINISTIC_OPS"] = "1"  # deterministic cuDNN (when available)
 tf.random.set_seed(42)
 np.random.seed(42)
 
-# --- Data Preparation ---
+# Mixed precision can speed up training on modern GPUs (comment out if issues)
+try:
+    tf.keras.mixed_precision.set_global_policy("mixed_float16")
+    MIXED_PREC = True
+except Exception:
+    MIXED_PREC = False
 
-# Define image size and batch size
+# ---------------------------
+# Config
+# ---------------------------
 IMG_HEIGHT, IMG_WIDTH = 240, 240
 BATCH_SIZE = 32
+EPOCHS = 50
+LR = 1e-3
 
-# Define paths for dataset folders (update paths as per actual locations)
-train_dir = 'data/train'  # Folder with subfolders 'glioma', 'meningioma', 'pituitary'
-val_dir = 'data/val'
-test_dir = 'data/test'
+DATA_DIR = "data"        # expects subdirs: train/ val/ test/
+TRAIN_DIR = os.path.join(DATA_DIR, "train")
+VAL_DIR   = os.path.join(DATA_DIR, "val")
+TEST_DIR  = os.path.join(DATA_DIR, "test")
 
-# Data augmentation and rescaling for training
-train_datagen = ImageDataGenerator(rescale=1./255,
-                                   rotation_range=20,
-                                   width_shift_range=0.1,
-                                   height_shift_range=0.1,
-                                   zoom_range=0.1,
-                                   horizontal_flip=True)
+OUT_DIR = "outputs"
+os.makedirs(OUT_DIR, exist_ok=True)
 
-# Rescaling for validation and test (no augmentation)
+# ---------------------------
+# Data: Augmentation + Generators
+# ---------------------------
+train_datagen = ImageDataGenerator(
+    rescale=1./255,
+    rotation_range=20,
+    width_shift_range=0.10,
+    height_shift_range=0.10,
+    zoom_range=0.10,
+    horizontal_flip=True,
+    fill_mode="nearest"
+)
 val_datagen = ImageDataGenerator(rescale=1./255)
 test_datagen = ImageDataGenerator(rescale=1./255)
 
-# Generate batches of augmented/normalized images and labels from directory
-train_generator = train_datagen.flow_from_directory(train_dir,
-                                                    target_size=(IMG_HEIGHT, IMG_WIDTH),
-                                                    batch_size=BATCH_SIZE,
-                                                    class_mode='categorical',  # multi-class classification
-                                                    shuffle=True)
+train_gen = train_datagen.flow_from_directory(
+    TRAIN_DIR,
+    target_size=(IMG_HEIGHT, IMG_WIDTH),
+    batch_size=BATCH_SIZE,
+    class_mode="categorical",
+    shuffle=True
+)
+val_gen = val_datagen.flow_from_directory(
+    VAL_DIR,
+    target_size=(IMG_HEIGHT, IMG_WIDTH),
+    batch_size=BATCH_SIZE,
+    class_mode="categorical",
+    shuffle=False
+)
+test_gen = test_datagen.flow_from_directory(
+    TEST_DIR,
+    target_size=(IMG_HEIGHT, IMG_WIDTH),
+    batch_size=BATCH_SIZE,
+    class_mode="categorical",
+    shuffle=False
+)
 
-val_generator = val_datagen.flow_from_directory(val_dir,
-                                                target_size=(IMG_HEIGHT, IMG_WIDTH),
-                                                batch_size=BATCH_SIZE,
-                                                class_mode='categorical',
-                                                shuffle=False)
+class_names = list(train_gen.class_indices.keys())
+num_classes = len(class_names)
+with open(os.path.join(OUT_DIR, "class_indices.json"), "w") as f:
+    json.dump(train_gen.class_indices, f, indent=2)
 
-test_generator = test_datagen.flow_from_directory(test_dir,
-                                                  target_size=(IMG_HEIGHT, IMG_WIDTH),
-                                                  batch_size=BATCH_SIZE,
-                                                  class_mode='categorical',
-                                                  shuffle=False)
+# ---------------------------
+# Optional: Class Weights (handle class imbalance)
+# ---------------------------
+def compute_class_weights(generator):
+    counts = np.zeros(num_classes, dtype=np.int64)
+    for _, cls_idx in generator.class_indices.items():
+        pass  # we need counts from generator.classes (available only for DirectoryIterator)
+    cls_counts = np.bincount(generator.classes, minlength=num_classes)
+    total = cls_counts.sum()
+    weights = {i: (total / (num_classes * cls_counts[i])) for i in range(num_classes) if cls_counts[i] > 0}
+    return weights, cls_counts
 
-# --- Define CNN Model Architecture ---
+class_weights, train_counts = compute_class_weights(train_gen)
+with open(os.path.join(OUT_DIR, "class_weights.json"), "w") as f:
+    json.dump({class_names[i]: class_weights[i] for i in range(num_classes)}, f, indent=2)
 
-model = Sequential()
+# ---------------------------
+# Model
+# ---------------------------
+def build_model():
+    model = Sequential(name="BrainTumorCNN")
+    # Block 1
+    model.add(Conv2D(32, (3,3), activation='relu', padding='same',
+                     input_shape=(IMG_HEIGHT, IMG_WIDTH, 3)))
+    model.add(BatchNormalization())
+    model.add(MaxPooling2D(pool_size=(2,2)))
+    model.add(Dropout(0.25))
 
-# First convolutional block
-model.add(Conv2D(32, (3, 3), activation='relu', padding='same', input_shape=(IMG_HEIGHT, IMG_WIDTH, 3)))
-model.add(BatchNormalization())
-model.add(MaxPooling2D(pool_size=(2, 2)))
-model.add(Dropout(0.25))
+    # Block 2
+    model.add(Conv2D(64, (3,3), activation='relu', padding='same'))
+    model.add(BatchNormalization())
+    model.add(MaxPooling2D(pool_size=(2,2)))
+    model.add(Dropout(0.25))
 
-# Second convolutional block
-model.add(Conv2D(64, (3, 3), activation='relu', padding='same'))
-model.add(BatchNormalization())
-model.add(MaxPooling2D(pool_size=(2, 2)))
-model.add(Dropout(0.25))
+    # Block 3
+    model.add(Conv2D(128, (3,3), activation='relu', padding='same'))
+    model.add(BatchNormalization())
+    model.add(MaxPooling2D(pool_size=(2,2)))
+    model.add(Dropout(0.25))
 
-# Third convolutional block
-model.add(Conv2D(128, (3, 3), activation='relu', padding='same'))
-model.add(BatchNormalization())
-model.add(MaxPooling2D(pool_size=(2, 2)))
-model.add(Dropout(0.25))
+    # Classifier head
+    model.add(Flatten())
+    model.add(Dense(128, activation='relu'))
+    model.add(Dropout(0.5))
+    model.add(Dense(num_classes, activation='softmax', dtype='float32'))  # force float32 output with mixed precision
 
-# Flattening and fully connected layers
-model.add(Flatten())
-model.add(Dense(128, activation='relu'))
-model.add(Dropout(0.5))
+    opt = Adam(learning_rate=LR)
+    model.compile(optimizer=opt, loss="categorical_crossentropy", metrics=["accuracy"])
+    return model
 
-# Output layer for 3 classes with softmax activation
-model.add(Dense(3, activation='softmax'))
-
-# Compile the model with Adam optimizer and categorical cross-entropy loss
-model.compile(optimizer=Adam(learning_rate=0.001),
-              loss='categorical_crossentropy',
-              metrics=['accuracy'])
-
-# Print model summary
+model = build_model()
 model.summary()
 
-# --- Train the model ---
+# ---------------------------
+# Callbacks
+# ---------------------------
+ckpt_path = os.path.join(OUT_DIR, "best_model.h5")
+callbacks = [
+    EarlyStopping(monitor="val_loss", patience=8, restore_best_weights=True, verbose=1),
+    ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=4, min_lr=1e-6, verbose=1),
+    ModelCheckpoint(ckpt_path, monitor="val_loss", save_best_only=True, verbose=1),
+    TensorBoard(log_dir=os.path.join(OUT_DIR, "tb_logs"))
+]
 
-# Use EarlyStopping to stop training if validation loss doesn't improve after 7 epochs
-early_stopping = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=7, restore_best_weights=True)
+# ---------------------------
+# Train
+# ---------------------------
+history = model.fit(
+    train_gen,
+    epochs=EPOCHS,
+    validation_data=val_gen,
+    callbacks=callbacks,
+    class_weight=class_weights,
+    verbose=2
+)
 
-# Train the model
-history = model.fit(train_generator,
-                    epochs=50,
-                    validation_data=val_generator,
-                    callbacks=[early_stopping])
+# Save final model
+final_model_path = os.path.join(OUT_DIR, "model_final.h5")
+model.save(final_model_path)
+with open(os.path.join(OUT_DIR, "train_counts.json"), "w") as f:
+    json.dump({class_names[i]: int(train_counts[i]) for i in range(num_classes)}, f, indent=2)
 
-# --- Evaluate model on test set ---
+# ---------------------------
+# Plot Training Curves (PNG for LaTeX)
+# ---------------------------
+def plot_curves(hist, out_dir):
+    # Accuracy
+    plt.figure(figsize=(6,4))
+    plt.plot(hist.history["accuracy"], label="Train Acc")
+    plt.plot(hist.history["val_accuracy"], label="Val Acc")
+    plt.xlabel("Epoch"); plt.ylabel("Accuracy"); plt.title("Accuracy vs. Epochs")
+    plt.legend(); plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    acc_path = os.path.join(out_dir, "accuracy_curve.png")
+    plt.savefig(acc_path, dpi=300); plt.close()
 
-test_loss, test_acc = model.evaluate(test_generator)
-print(f"Test Accuracy: {test_acc*100:.2f}%")
+    # Loss
+    plt.figure(figsize=(6,4))
+    plt.plot(hist.history["loss"], label="Train Loss")
+    plt.plot(hist.history["val_loss"], label="Val Loss")
+    plt.xlabel("Epoch"); plt.ylabel("Loss"); plt.title("Loss vs. Epochs")
+    plt.legend(); plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    loss_path = os.path.join(out_dir, "loss_curve.png")
+    plt.savefig(loss_path, dpi=300); plt.close()
+    return acc_path, loss_path
 
-# Predict classes for test set
-y_pred_probs = model.predict(test_generator)
-y_pred = np.argmax(y_pred_probs, axis=1)
+acc_png, loss_png = plot_curves(history, OUT_DIR)
 
-# True labels
-y_true = test_generator.classes
+# ---------------------------
+# Evaluate + Predictions
+# ---------------------------
+test_loss, test_acc = model.evaluate(test_gen, verbose=0)
+print(f"[TEST] Loss: {test_loss:.4f} | Accuracy: {test_acc*100:.2f}%")
 
-# Classification report
-target_names = list(test_generator.class_indices.keys())
-print(classification_report(y_true, y_pred, target_names=target_names))
+y_prob = model.predict(test_gen, verbose=0)
+y_pred = np.argmax(y_prob, axis=1)
+y_true = test_gen.classes
+target_names = class_names
 
-# Confusion matrix
+# Save classification report to TXT
+report = classification_report(y_true, y_pred, target_names=target_names, digits=3)
+with open(os.path.join(OUT_DIR, "classification_report.txt"), "w") as f:
+    f.write(report)
+print(report)
+
+# Confusion Matrix (PNG)
+def plot_confusion(cm, labels, out_path, normalize=True):
+    from matplotlib import cm as mplcm
+    cmn = cm.astype("float")
+    if normalize:
+        cmn = cmn / cmn.sum(axis=1, keepdims=True)
+    plt.figure(figsize=(5.2,4.5))
+    plt.imshow(cmn, interpolation='nearest', cmap=mplcm.Blues)
+    plt.title("Confusion Matrix")
+    plt.colorbar()
+    tick_marks = np.arange(len(labels))
+    plt.xticks(tick_marks, labels, rotation=45, ha="right")
+    plt.yticks(tick_marks, labels)
+    # annotate
+    thresh = cmn.max() / 2.
+    for i in range(cmn.shape[0]):
+        for j in range(cmn.shape[1]):
+            val = cmn[i, j]
+            txt = f"{val:.2f}" if normalize else f"{int(cm[i,j])}"
+            plt.text(j, i, txt, horizontalalignment="center",
+                     color="white" if val > thresh else "black")
+    plt.ylabel('True label'); plt.xlabel('Predicted label')
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=300); plt.close()
+
 cm = confusion_matrix(y_true, y_pred)
-print("Confusion Matrix:")
-print(cm)
+plot_confusion(cm, target_names, os.path.join(OUT_DIR, "confusion_matrix.png"))
 
-# --- Measure inference efficiency ---
+# ---------------------------
+# ROC & PR Curves (per-class)
+# ---------------------------
+def plot_roc_pr(y_true_idx, y_prob, labels, out_dir):
+    # One-hot true
+    y_true_1h = tf.keras.utils.to_categorical(y_true_idx, num_classes=len(labels))
+    # ROC per class
+    plt.figure(figsize=(6,4))
+    for i, lbl in enumerate(labels):
+        fpr, tpr, _ = roc_curve(y_true_1h[:, i], y_prob[:, i])
+        plt.plot(fpr, tpr, label=f"{lbl} (AUC={auc(fpr, tpr):.3f})")
+    plt.plot([0,1], [0,1], 'k--', lw=1)
+    plt.xlabel("False Positive Rate"); plt.ylabel("True Positive Rate")
+    plt.title("ROC Curves (per class)"); plt.legend()
+    plt.grid(True, alpha=0.3); plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "roc_curves.png"), dpi=300); plt.close()
 
-# Number of test samples
-num_samples = test_generator.samples
+    # PR per class
+    plt.figure(figsize=(6,4))
+    for i, lbl in enumerate(labels):
+        precision, recall, _ = precision_recall_curve(y_true_1h[:, i], y_prob[:, i])
+        ap = auc(recall, precision)
+        plt.plot(recall, precision, label=f"{lbl} (AP={ap:.3f})")
+    plt.xlabel("Recall"); plt.ylabel("Precision")
+    plt.title("Precision–Recall Curves (per class)"); plt.legend()
+    plt.grid(True, alpha=0.3); plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "pr_curves.png"), dpi=300); plt.close()
 
-# To test inference speed, predict one image at a time repeatedly
-start_time = time.time()
+plot_roc_pr(y_true, y_prob, target_names, OUT_DIR)
 
-# Iterate through all samples one-by-one to measure latency
-for i in range(num_samples):
-    img, _ = test_generator[i]
-    model.predict(img)  # Single batch predict (batch size usually 32)
+# ---------------------------
+# Grad-CAM (optional quicklook on a few test images)
+# ---------------------------
+def grad_cam_heatmap(model, img_batch, class_index=None, layer_name=None):
+    # pick last conv layer automatically
+    if layer_name is None:
+        layer_name = None
+        for layer in reversed(model.layers):
+            if isinstance(layer, Conv2D):
+                layer_name = layer.name
+                break
+    if layer_name is None:
+        raise ValueError("No Conv2D layer found for Grad-CAM.")
+    grad_model = tf.keras.models.Model(
+        [model.inputs], [model.get_layer(layer_name).output, model.output]
+    )
+    with tf.GradientTape() as tape:
+        conv_out, preds = grad_model(img_batch)
+        if class_index is None:
+            class_index = tf.argmax(preds[0])
+        class_channel = preds[:, class_index]
+    grads = tape.gradient(class_channel, conv_out)
+    pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
+    conv_out = conv_out[0]
+    heatmap = tf.reduce_sum(tf.multiply(pooled_grads, conv_out), axis=-1)
+    heatmap = tf.maximum(heatmap, 0) / (tf.reduce_max(heatmap) + 1e-8)
+    return heatmap.numpy()
 
-end_time = time.time()
-total_time = end_time - start_time
+try:
+    batch_imgs, _ = next(test_gen)  # one batch
+    hm = grad_cam_heatmap(model, batch_imgs[0:1])
+    # overlay helper
+    import cv2
+    img = (batch_imgs[0] * 255).astype("uint8")
+    heatmap = cv2.resize((hm*255).astype("uint8"), (IMG_WIDTH, IMG_HEIGHT))
+    heatmap_color = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
+    overlay = cv2.addWeighted(img, 0.6, heatmap_color, 0.4, 0)
+    cv2.imwrite(os.path.join(OUT_DIR, "gradcam_example.png"), cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
+except Exception as e:
+    print(f"[Grad-CAM] Skipped: {e}")
 
-# Calculate throughput (images per second)
-throughput = num_samples / total_time
-avg_latency_ms = (total_time / num_samples) * 1000
+# ---------------------------
+# Inference Speed (clean timing)
+# ---------------------------
+# Use predict on entire test set and time it (warm-up + timed run)
+_ = model.predict(test_gen, verbose=0)  # warm up
+t0 = time.time()
+_ = model.predict(test_gen, verbose=0)
+t1 = time.time()
+num_imgs = test_gen.samples
+elapsed = t1 - t0
+throughput = num_imgs / elapsed
+lat_ms = (elapsed / num_imgs) * 1000.0
+print(f"[Speed] Throughput: {throughput:.2f} img/s | Avg Latency: {lat_ms:.2f} ms/img")
 
-print(f"Inference throughput: {throughput:.2f} images/second")
-print(f"Average latency per image: {avg_latency_ms:.2f} ms")
+with open(os.path.join(OUT_DIR, "speed.json"), "w") as f:
+    json.dump({"throughput_img_s": throughput, "latency_ms_per_img": lat_ms}, f, indent=2)
 
-# --- End of script ---
+print(f"\nArtifacts saved to: {OUT_DIR}")
+print(f"Figures for LaTeX: {acc_png}, {loss_png}, confusion_matrix.png, roc_curves.png, pr_curves.png, gradcam_example.png")
