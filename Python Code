@@ -1,249 +1,294 @@
-import os
-import time
-import json
+# Multimodal CNN for Brain MRI (T1, T2, FLAIR Fusion (Results and Visualizations)
+
+Full Code:
+# Multimodal CNN (T1, T2, FLAIR)
+# Patient-level split (70/15/15)
+
+import os, h5py, cv2
 import numpy as np
-import tensorflow as tf
+import pandas as pd
 import matplotlib.pyplot as plt
-
-from sklearn.metrics import classification_report, confusion_matrix, roc_curve, auc, precision_recall_curve
+import seaborn as sns
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import confusion_matrix, accuracy_score, roc_curve, auc, precision_score, recall_score, f1_score
+from sklearn.utils.class_weight import compute_class_weight
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Conv2D, MaxPooling2D, Flatten, Dense, Dropout, BatchNormalization
-from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.layers import Conv2D, MaxPooling2D, Flatten, Dense, Dropout
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
-from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint, TensorBoard
 
-# Reproducibility
-os.environ["PYTHONHASHSEED"] = "42"
-os.environ["TF_DETERMINISTIC_OPS"] = "1"
-tf.random.set_seed(42)
-np.random.seed(42)
+# 1) Loader (patient-aware, fusion)
+def load_multimodal_by_patient(csv_file, base_path, max_patients=None, slices_per_patient=None, resize=(128,128)):
+    df = pd.read_csv(csv_file)
+    df['slice_path'] = df['slice_path'].apply(lambda x: os.path.join(base_path, os.path.basename(x)))
 
-try:
-    tf.keras.mixed_precision.set_global_policy("mixed_float16")
-    MIXED_PREC = True
-except Exception:
-    MIXED_PREC = False
+    grouped = df.groupby('volume')
+    patient_ids = list(grouped.groups.keys())
 
-# Config
-IMG_HEIGHT, IMG_WIDTH = 240, 240
-BATCH_SIZE = 32
-EPOCHS = 50
-LR = 1e-3
+    if max_patients:
+        patient_ids = patient_ids[:max_patients]
 
-DATA_DIR = "Tumor_Type"        # Root dataset folder
-TRAIN_DIR = os.path.join(DATA_DIR, "train")
-VAL_DIR = os.path.join(DATA_DIR, "val")
-TEST_DIR = os.path.join(DATA_DIR, "test")
+    X, y, patient_labels = [], [], []
 
-OUT_DIR = "outputs"
-os.makedirs(OUT_DIR, exist_ok=True)
+    for pid in patient_ids:
+        patient_df = grouped.get_group(pid)
+        patient_df = patient_df.sample(frac=1, random_state=42).reset_index(drop=True)
 
-# Data augmentation and generators
-train_datagen = ImageDataGenerator(
-    rescale=1./255,
-    rotation_range=20,
-    width_shift_range=0.10,
-    height_shift_range=0.10,
-    zoom_range=0.10,
-    horizontal_flip=True,
-    fill_mode="nearest"
-)
-val_datagen = ImageDataGenerator(rescale=1./255)
-test_datagen = ImageDataGenerator(rescale=1./255)
+        if slices_per_patient:
+            patient_df = patient_df.iloc[:slices_per_patient]
 
-train_gen = train_datagen.flow_from_directory(
-    TRAIN_DIR,
-    target_size=(IMG_HEIGHT, IMG_WIDTH),
-    batch_size=BATCH_SIZE,
-    class_mode="categorical",
-    shuffle=True
-)
-val_gen = val_datagen.flow_from_directory(
-    VAL_DIR,
-    target_size=(IMG_HEIGHT, IMG_WIDTH),
-    batch_size=BATCH_SIZE,
-    class_mode="categorical",
-    shuffle=False
-)
-test_gen = test_datagen.flow_from_directory(
-    TEST_DIR,
-    target_size=(IMG_HEIGHT, IMG_WIDTH),
-    batch_size=BATCH_SIZE,
-    class_mode="categorical",
-    shuffle=False
+        for _, row in patient_df.iterrows():
+            if not os.path.exists(row['slice_path']):
+                continue
+            with h5py.File(row['slice_path'], 'r') as f:
+                img = f['image'][:, :, :3].astype(np.float32)   # fusion: T1, T2, FLAIR
+                img = cv2.resize(img, resize)
+
+                # Per-channel min-max normalization
+                for c in range(img.shape[-1]):
+                    ch = img[:,:,c]
+                    mn, mx = float(ch.min()), float(ch.max())
+                    img[:,:,c] = (ch - mn) / (mx - mn + 1e-8)
+
+                X.append(img)
+                y.append(int(row['target']))
+                patient_labels.append(pid)
+
+    return np.array(X, dtype='float32'), np.array(y, dtype='int'), np.array(patient_labels)
+
+# 2) Load data
+
+csv_path = "/content/brats2020/BraTS20 Training Metadata.csv"
+base_path = "/content/brats2020/BraTS2020_training_data/content/data/"
+
+# Limit to avoid RAM crash (250 patients)
+X, y, patient_ids = load_multimodal_by_patient(
+    csv_path, base_path, max_patients=250, slices_per_patient=50, resize=(128,128)
 )
 
-class_names = list(train_gen.class_indices.keys())
-num_classes = len(class_names)
-with open(os.path.join(OUT_DIR, "class_indices.json"), "w") as f:
-    json.dump(train_gen.class_indices, f, indent=2)
+print("Data shape:", X.shape, y.shape)
+print("Unique patients:", len(np.unique(patient_ids)))
 
-# Compute class weights for imbalance handling
-def compute_class_weights(generator):
-    cls_counts = np.bincount(generator.classes, minlength=num_classes)
-    total = cls_counts.sum()
-    weights = {i: (total / (num_classes * cls_counts[i])) for i in range(num_classes) if cls_counts[i] > 0}
-    return weights, cls_counts
+# 3) Patient-level split (70/15/15)
+unique_pids = np.unique(patient_ids)
 
-class_weights, train_counts = compute_class_weights(train_gen)
-with open(os.path.join(OUT_DIR, "class_weights.json"), "w") as f:
-    json.dump({class_names[i]: class_weights[i] for i in range(num_classes)}, f, indent=2)
+# hold out 15% for test
+trainval_pids, test_pids = train_test_split(unique_pids, test_size=0.15, random_state=42)
 
-# Build CNN model
-def build_model():
-    model = Sequential(name="BrainTumorCNN")
-    model.add(Conv2D(32, (3,3), activation='relu', padding='same',
-                     input_shape=(IMG_HEIGHT, IMG_WIDTH, 3)))
-    model.add(BatchNormalization())
-    model.add(MaxPooling2D(pool_size=(2,2)))
-    model.add(Dropout(0.25))
+# Then: from remaining 85%, carve out ~17.6% for validation (~15% of total)
+val_size = 0.1764705882
+train_pids, val_pids = train_test_split(trainval_pids, test_size=val_size, random_state=42)
 
-    model.add(Conv2D(64, (3,3), activation='relu', padding='same'))
-    model.add(BatchNormalization())
-    model.add(MaxPooling2D(pool_size=(2,2)))
-    model.add(Dropout(0.25))
+def mask_by_pids(X, y, pids, patient_ids):
+    mask = np.isin(patient_ids, pids)
+    return X[mask], y[mask]
 
-    model.add(Conv2D(128, (3,3), activation='relu', padding='same'))
-    model.add(BatchNormalization())
-    model.add(MaxPooling2D(pool_size=(2,2)))
-    model.add(Dropout(0.25))
+X_train, y_train = mask_by_pids(X, y, train_pids, patient_ids)
+X_val, y_val     = mask_by_pids(X, y, val_pids, patient_ids)
+X_test, y_test   = mask_by_pids(X, y, test_pids, patient_ids)
 
-    model.add(Flatten())
-    model.add(Dense(128, activation='relu'))
-    model.add(Dropout(0.5))
-    model.add(Dense(num_classes, activation='softmax', dtype='float32'))
+print(f"Train {len(X_train)}, Val {len(X_val)}, Test {len(X_test)}")
 
-    opt = Adam(learning_rate=LR)
-    model.compile(optimizer=opt, loss="categorical_crossentropy", metrics=["accuracy"])
-    return model
+# 4) Class weights
+cw = compute_class_weight('balanced', classes=np.unique(y_train), y=y_train)
+class_weight = dict(enumerate(cw))
+print("Class weights:", class_weight)
 
-model = build_model()
+# 5) Model
+
+input_shape = X.shape[1:]
+model = Sequential([
+    Conv2D(32, (3,3), activation='relu', input_shape=input_shape, padding='same'),
+    MaxPooling2D(2,2),
+    Conv2D(64, (3,3), activation='relu', padding='same'),
+    MaxPooling2D(2,2),
+    Conv2D(128, (3,3), activation='relu', padding='same'),
+    MaxPooling2D(2,2),
+    Flatten(),
+    Dense(256, activation='relu'),
+    Dropout(0.5),
+    Dense(1, activation='sigmoid')   # binary sigmoid insetad of softmax #since it classifies yes tumor or no tumor, no multiclassification
+])
+model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
 model.summary()
 
-# Callbacks
-ckpt_path = os.path.join(OUT_DIR, "best_model.h5")
-callbacks = [
-    EarlyStopping(monitor="val_loss", patience=8, restore_best_weights=True, verbose=1),
-    ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=4, min_lr=1e-6, verbose=1),
-    ModelCheckpoint(ckpt_path, monitor="val_loss", save_best_only=True, verbose=1),
-    TensorBoard(log_dir=os.path.join(OUT_DIR, "tb_logs"))
-]
-
-# Train model
-history = model.fit(
-    train_gen,
-    epochs=EPOCHS,
-    validation_data=val_gen,
-    callbacks=callbacks,
-    class_weight=class_weights,
-    verbose=2
+# 6) Data augmentation (for overfitting.)
+train_datagen = ImageDataGenerator(
+    rotation_range=10,
+    width_shift_range=0.05,
+    height_shift_range=0.05,
+    horizontal_flip=True,
+    vertical_flip=False  # MRI is not usually flipped vertically
 )
 
-# Save final model
-final_model_path = os.path.join(OUT_DIR, "model_final.h5")
-model.save(final_model_path)
-with open(os.path.join(OUT_DIR, "train_counts.json"), "w") as f:
-    json.dump({class_names[i]: int(train_counts[i]) for i in range(num_classes)}, f, indent=2)
+val_datagen = ImageDataGenerator()
 
-# Plot training curves (accuracy and loss saved as PNGs)
-def plot_curves(hist, out_dir):
-    plt.figure(figsize=(6,4))
-    plt.plot(hist.history["accuracy"], label="Train Acc")
-    plt.plot(hist.history["val_accuracy"], label="Val Acc")
-    plt.xlabel("Epoch"); plt.ylabel("Accuracy"); plt.title("Accuracy vs. Epochs")
-    plt.legend(); plt.grid(True, alpha=0.3)
+train_gen = train_datagen.flow(X_train, y_train, batch_size=32)
+val_gen   = val_datagen.flow(X_val, y_val, batch_size=32)
+
+# 7) Training (early stoppin to)
+early_stop = EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
+chk = ModelCheckpoint('best_model.h5', monitor='val_loss', save_best_only=True)
+
+history = model.fit(
+    train_gen,
+    validation_data=val_gen,
+    epochs=50,
+    class_weight=class_weight,
+    callbacks=[early_stop, chk],
+    verbose=1
+)
+
+# 8) Evaluation
+y_test_prob = model.predict(X_test).ravel()
+y_test_pred = (y_test_prob >= 0.5).astype(int)
+
+test_acc = accuracy_score(y_test, y_test_pred)
+prec = precision_score(y_test, y_test_pred)
+rec = recall_score(y_test, y_test_pred)
+f1 = f1_score(y_test, y_test_pred)
+
+print(f"Test Accuracy: {test_acc*100:.2f}%")
+print(f"Precision: {prec:.3f}, Recall: {rec:.3f}, F1: {f1:.3f}")
+
+# Confusion Matrix
+cm = confusion_matrix(y_test, y_test_pred)
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+            xticklabels=['No Tumor','Tumor'], yticklabels=['No Tumor','Tumor'])
+plt.xlabel('Predicted Labels')
+plt.ylabel('True Labels')
+plt.title('Confusion Matrix')
+plt.savefig("confusion_matrix_aug.png", bbox_inches='tight')
+plt.show()
+
+# ROC Curve
+fpr, tpr, _ = roc_curve(y_test, y_test_prob)
+roc_auc = auc(fpr, tpr)
+plt.plot(fpr, tpr, label=f"AUC={roc_auc:.3f}")
+plt.plot([0,1],[0,1],'k--')
+plt.legend()
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.title('ROC Curve')
+plt.savefig("roc_curve_aug.png", bbox_inches='tight')
+plt.show()
+
+# 9) Training curves
+plt.figure(figsize=(12,5))
+plt.subplot(1,2,1)
+plt.plot(history.history['accuracy'], label='Train Acc')
+plt.plot(history.history['val_accuracy'], label='Val Acc')
+plt.xlabel("Epochs")
+plt.ylabel("Accuracy")
+plt.title("Training & Validation Accuracy")
+plt.legend()
+
+plt.subplot(1,2,2)
+plt.plot(history.history['loss'], label='Train Loss')
+plt.plot(history.history['val_loss'], label='Val Loss')
+plt.xlabel("Epochs")
+plt.ylabel("Loss")
+plt.title("Training & Validation Loss")
+plt.legend()
+
+plt.savefig("training_val_curves_aug.png", bbox_inches='tight')
+plt.show()
+
+# 10) Visualize modalities
+
+def show_modalities(X, y, num_samples=3):
+    idxs = np.random.choice(len(X), num_samples, replace=False)
+    for idx in idxs:
+        img = X[idx]
+        lab = y[idx]
+        plt.figure(figsize=(12,3))
+        plt.subplot(1,4,1); plt.imshow(img[:,:,0], cmap='gray'); plt.title('T1'); plt.axis('off')
+        plt.subplot(1,4,2); plt.imshow(img[:,:,1], cmap='gray'); plt.title('T2'); plt.axis('off')
+        plt.subplot(1,4,3); plt.imshow(img[:,:,2], cmap='gray'); plt.title('FLAIR'); plt.axis('off')
+        plt.subplot(1,4,4); plt.imshow(img); plt.title(f'Fused (label={lab})'); plt.axis('off')
+        plt.show()
+
+show_modalities(X, y, num_samples=3)
+
+# Visualization: modalities + fused + predictions
+
+def visualize_prediction(X, y_true, y_prob, idx, class_names={0:"No Tumor", 1:"Tumor"}):
+    """
+    Show T1, T2, FLAIR, and fused image with prediction info.
+
+    Parameters:
+    - X: array of shape (N,H,W,3)
+    - y_true: true labels (0/1)
+    - y_prob: predicted probabilities (floats [0,1])
+    - idx: sample index
+    """
+    img = X[idx]
+    true = y_true[idx]
+    prob = y_prob[idx]
+    pred = int(prob >= 0.5)
+
+    plt.figure(figsize=(14,4))
+
+    # T1
+    plt.subplot(1,4,1)
+    plt.imshow(img[:,:,0], cmap="gray")
+    plt.title("T1")
+    plt.axis("off")
+
+    # T2
+    plt.subplot(1,4,2)
+    plt.imshow(img[:,:,1], cmap="gray")
+    plt.title("T2")
+    plt.axis("off")
+
+    # FLAIR
+    plt.subplot(1,4,3)
+    plt.imshow(img[:,:,2], cmap="gray")
+    plt.title("FLAIR")
+    plt.axis("off")
+
+    # Fused RGB
+    plt.subplot(1,4,4)
+    plt.imshow(img)
+    plt.title(f"Fused\nTrue: {class_names[true]}\nPred: {class_names[pred]} ({prob:.2f})")
+    plt.axis("off")
+
     plt.tight_layout()
-    acc_path = os.path.join(out_dir, "accuracy_curve.png")
-    plt.savefig(acc_path, dpi=300)
-    plt.close()
+    plt.show()
 
-    plt.figure(figsize=(6,4))
-    plt.plot(hist.history["loss"], label="Train Loss")
-    plt.plot(hist.history["val_loss"], label="Val Loss")
-    plt.xlabel("Epoch"); plt.ylabel("Loss"); plt.title("Loss vs. Epochs")
-    plt.legend(); plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    loss_path = os.path.join(out_dir, "loss_curve.png")
-    plt.savefig(loss_path, dpi=300)
-    plt.close()
-    return acc_path, loss_path
+# Example: visualize 4 random test samples
+idxs = np.random.choice(len(X_test), 4, replace=False)
+for idx in idxs:
+    visualize_prediction(X_test, y_test, y_test_prob, idx)
 
-acc_png, loss_png = plot_curves(history, OUT_DIR)
+from sklearn.metrics import precision_score, recall_score, f1_score, accuracy_score, classification_report
 
-# Evaluate model on test set
-test_loss, test_acc = model.evaluate(test_gen, verbose=0)
-print(f"[TEST] Loss: {test_loss:.4f} | Accuracy: {test_acc*100:.2f}%")
+# Compute metrics
+accuracy = accuracy_score(y_test, y_test_pred)
+precision = precision_score(y_test, y_test_pred)
+recall = recall_score(y_test, y_test_pred)
+f1 = f1_score(y_test, y_test_pred)
 
-y_prob = model.predict(test_gen, verbose=0)
-y_pred = np.argmax(y_prob, axis=1)
-y_true = test_gen.classes
+# Print metrics
+print(f"Accuracy:  {accuracy:.3f}")
+print(f"Precision: {precision:.3f}")
+print(f"Recall:    {recall:.3f}")
+print(f"F1 Score:  {f1:.3f}")
 
-report = classification_report(y_true, y_pred, target_names=class_names, digits=3)
-with open(os.path.join(OUT_DIR, "classification_report.txt"), "w") as f:
-    f.write(report)
-print(report)
+# Full classification report
+class_report = classification_report(y_test, y_test_pred, target_names=['No Tumor', 'Tumor'])
+print("\nClassification Report:\n")
+print(class_report)
 
-# Plot Confusion Matrix
-def plot_confusion(cm, labels, out_path, normalize=True):
-    from matplotlib import cm as mplcm
-    cmn = cm.astype("float")
-    if normalize:
-        cmn = cmn / cmn.sum(axis=1, keepdims=True)
-    plt.figure(figsize=(5.2,4.5))
-    plt.imshow(cmn, interpolation='nearest', cmap=mplcm.Blues)
-    plt.title("Confusion Matrix")
-    plt.colorbar()
-    tick_marks = np.arange(len(labels))
-    plt.xticks(tick_marks, labels, rotation=45, ha="right")
-    plt.yticks(tick_marks, labels)
-    thresh = cmn.max() / 2.
-    for i in range(cmn.shape[0]):
-        for j in range(cmn.shape[1]):
-            val = cmn[i, j]
-            txt = f"{val:.2f}" if normalize else f"{int(cm[i,j])}"
-            plt.text(j, i, txt, horizontalalignment="center",
-                     color="white" if val > thresh else "black")
-    plt.ylabel('True label'); plt.xlabel('Predicted label')
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=300)
-    plt.close()
+# Save report to file
+with open("classification_report.txt", "w") as f:
+    f.write(f"Accuracy: {accuracy:.3f}\n")
+    f.write(f"Precision: {precision:.3f}\n")
+    f.write(f"Recall: {recall:.3f}\n")
+    f.write(f"F1 Score: {f1:.3f}\n\n")
+    f.write("Full Classification Report:\n")
+    f.write(class_report)
 
-cm = confusion_matrix(y_true, y_pred)
-plot_confusion(cm, class_names, os.path.join(OUT_DIR, "confusion_matrix.png"))
+print("\nClassification report saved as 'classification_report.txt'")
 
-# Plot ROC and Precision-Recall curves
-def plot_roc_pr(y_true_idx, y_prob, labels, out_dir):
-    y_true_1h = tf.keras.utils.to_categorical(y_true_idx, num_classes=len(labels))
 
-    plt.figure(figsize=(6,4))
-    for i, lbl in enumerate(labels):
-        fpr, tpr, _ = roc_curve(y_true_1h[:, i], y_prob[:, i])
-        plt.plot(fpr, tpr, label=f"{lbl} (AUC={auc(fpr, tpr):.3f})")
-    plt.plot([0,1], [0,1], 'k--', lw=1)
-    plt.xlabel("False Positive Rate")
-    plt.ylabel("True Positive Rate")
-    plt.title("ROC Curves (per class)")
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(os.path.join(out_dir, "roc_curves.png"), dpi=300)
-    plt.close()
-
-    plt.figure(figsize=(6,4))
-    for i, lbl in enumerate(labels):
-        precision, recall, _ = precision_recall_curve(y_true_1h[:, i], y_prob[:, i])
-        ap = auc(recall, precision)
-        plt.plot(recall, precision, label=f"{lbl} (AP={ap:.3f})")
-    plt.xlabel("Recall")
-    plt.ylabel("Precision")
-    plt.title("Precision–Recall Curves (per class)")
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(os.path.join(out_dir, "pr_curves.png"), dpi=300)
-    plt.close()
-
-plot_roc_pr(y_true, y_prob, class_names, OUT_DIR)
-
-print(f"\nArtifacts saved to: {OUT_DIR}")
-print(f"Figures for LaTeX: {acc_png}, {loss_png}, confusion_matrix.png, roc_curves.png, pr_curves.png")
